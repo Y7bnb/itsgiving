@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-its_giving.py — meme reactions on top of your face, live in Zoom / Meet.
+its_giving_v2.py — meme reactions on top of your face, live in Zoom / Meet.
 
-MediaPipe tracks your face, hands and upper body; when a pose matches, the
-matching image or GIF is pasted over your face and the frame goes out through a
-virtual camera. See README.md.
+Same as its_giving.py, but expression thresholds are measured in standard
+deviations above your own resting face rather than against fixed constants.
+Seven seconds of calibration; see README.md.
 
-  python its_giving.py [--camera 1] [--no-vcam] [--size 640x480] [--no-flip]
+  python its_giving_v2.py --calibrate
+  python its_giving_v2.py [--camera 1] [--no-vcam] [--size 640x480] [--no-flip]
 
-Keys:  q quit   d toggle HUD   1-9 0 - = [ ] force-show a pose
+Keys:  q quit   d toggle HUD   c recalibrate   1-9 0 - = [ ] force-show a pose
 """
 import argparse
+import json
 import os
 import platform
 import subprocess
@@ -34,17 +36,45 @@ ARM = {
     "spin": 15, "suspicious": 8, "talking_to_wall": 6, "dance": 6, "crashing_out": 4,
     "open_mouth": 4, "tongue_out": 5, "disgusted": 5,
 }
+
+Z = dict(
+    jaw_open=6.0,
+    scream_jaw=3.5,
+    tongue_jaw=3.5,
+    sneer=4.5,
+    disgust=14.0,
+    squint=4.0,
+)
+Z_CAP = 8.0
+FLOOR = dict(
+    jaw_open=0.30,
+    scream_jaw=0.18,
+    tongue_jaw=0.18,
+    sneer=0.06,
+    squint=0.18,
+)
 T = dict(
-    jaw_open=0.5,
-    scream_jaw=0.3,
-    tongue_jaw=0.3,
     tongue=0.5,
-    sneer=0.12,
-    disgust=0.6,
     head_turn=0.15,
-    squint=0.3,
     gesture=0.035,
 )
+
+CALIB_FILE = "calibration.json"
+CALIB_SECONDS = 7.0
+CALIB_WARMUP = 1.5
+CALIB_MIN_SAMPLES = 30
+SIGMA_FLOOR = 0.015
+SIGMA_CEIL = 0.080
+CALIB_VERSION = 1
+
+GENERIC_SIGMA = 0.035
+GENERIC_MEAN = {
+    "jawOpen": 0.08, "eyeSquintLeft": 0.10, "eyeSquintRight": 0.10,
+    "eyeBlinkLeft": 0.10, "eyeBlinkRight": 0.10, "noseSneerLeft": 0.03, "noseSneerRight": 0.03,
+    "browDownLeft": 0.06, "browDownRight": 0.06, "mouthFrownLeft": 0.05, "mouthFrownRight": 0.05,
+    "mouthUpperUpLeft": 0.05, "mouthUpperUpRight": 0.05,
+}
+
 INNER_LIPS = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191]
 
 MODELS = {
@@ -107,6 +137,156 @@ def build_detectors(model_paths):
         base_options=mp_tasks.BaseOptions(model_asset_path=model_paths["pose_landmarker_lite.task"]),
         running_mode=vision.RunningMode.VIDEO, num_poses=1))
     return face, hand, pose
+
+
+class Clock:
+    """Strictly increasing timestamps for the life of a detector, recalibrations included."""
+
+    def __init__(self):
+        self.t0, self.last = time.monotonic(), -1
+
+    def next(self):
+        self.last = max(int((time.monotonic() - self.t0) * 1000), self.last + 1)
+        return self.last
+
+
+class Baseline:
+    """Your resting face: a mean and a wobble for every channel."""
+
+    def __init__(self, mean=None, sigma=None, samples=0, made=None):
+        self.mean = mean or {}
+        self.sigma = sigma or {}
+        self.samples = samples
+        self.made = made
+        self.generic = not self.mean
+
+    def z(self, name, value):
+        """How far above your neutral this channel is, in standard deviations."""
+        if self.generic:
+            return (value - GENERIC_MEAN.get(name, 0.02)) / GENERIC_SIGMA
+        m = self.mean.get(name)
+        if m is None:
+            return (value - GENERIC_MEAN.get(name, 0.02)) / GENERIC_SIGMA
+        return (value - m) / self.sigma.get(name, SIGMA_CEIL)
+
+    @property
+    def neutral_turn(self):
+        return self.mean.get("turn_signed", 0.0) if not self.generic else 0.0
+
+    def save(self, path):
+        with open(path, "w") as fh:
+            json.dump({"version": CALIB_VERSION, "made": self.made, "samples": self.samples,
+                       "mean": self.mean, "sigma": self.sigma}, fh, indent=1, sort_keys=True)
+
+    @staticmethod
+    def load(path):
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return Baseline()
+        if data.get("version") != CALIB_VERSION or not data.get("mean"):
+            return Baseline()
+        return Baseline(data["mean"], data.get("sigma", {}), data.get("samples", 0), data.get("made"))
+
+
+class Collector:
+    """Running mean and standard deviation per channel, over the calibration window."""
+
+    def __init__(self):
+        self.n, self.s, self.ss = 0, {}, {}
+
+    def add(self, face):
+        self.n += 1
+        for name, v in list(face.bs.items()) + [("turn_signed", face.turn_signed)]:
+            self.s[name] = self.s.get(name, 0.0) + v
+            self.ss[name] = self.ss.get(name, 0.0) + v * v
+
+    def finish(self):
+        mean, sigma = {}, {}
+        for name, total in self.s.items():
+            m = total / self.n
+            var = max(self.ss[name] / self.n - m * m, 0.0)
+            mean[name] = round(m, 5)
+            sigma[name] = round(min(max(var ** 0.5, SIGMA_FLOOR), SIGMA_CEIL), 5)
+        sigma["turn_signed"] = min(max(sigma.get("turn_signed", 0.02), 0.01), 0.10)
+        return Baseline(mean, sigma, self.n, time.strftime("%Y-%m-%d %H:%M"))
+
+
+def calibration_warnings(base):
+    """Catch the two ways a calibration goes wrong: mid-expression, or fidgeting."""
+    out = []
+    if base.mean.get("jawOpen", 0) > 0.30:
+        out.append("your mouth looks like it was open — don't talk during calibration")
+    if max(base.mean.get("noseSneerLeft", 0), base.mean.get("noseSneerRight", 0)) > 0.15:
+        out.append("your nose was scrunched — hold a bored face, not a reaction")
+    if max(base.mean.get("browInnerUp", 0), base.mean.get("browOuterUpLeft", 0)) > 0.35:
+        out.append("your eyebrows were up — relax them")
+    pinned = sum(1 for k, v in base.sigma.items() if v >= SIGMA_CEIL)
+    if pinned > 12:
+        out.append("you moved a lot — sit still and try again for a tighter baseline")
+    return out
+
+
+def run_calibration(cap, face_det, clock, args, W, H, window):
+    """Watch a bored face for CALIB_SECONDS and learn what its channels rest at."""
+    print(f"\nCalibrating for {CALIB_SECONDS:.0f}s. Sit how you normally sit, look at the "
+          "camera, hold a bored face.\nBlinking is fine. Don't talk, smile or raise your eyebrows.")
+    col, start, seen_face = Collector(), time.monotonic(), 0
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed > CALIB_SECONDS:
+            break
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame.shape[0] != H or frame.shape[1] != W:
+            frame = cv2.resize(frame, (W, H))
+        if not args.no_flip:
+            frame = cv2.flip(frame, 1)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        fr = face_det.detect_for_video(mp_img, clock.next())
+        face = Face(fr.face_landmarks[0], fr.face_blendshapes[0] if fr.face_blendshapes else None, W, H) \
+            if fr.face_landmarks else None
+        if face is not None:
+            seen_face += 1
+            if elapsed > CALIB_WARMUP and face.bs:
+                col.add(face)
+        draw_calibration(frame, elapsed, col.n, face)
+        cv2.imshow(window, frame)
+        if (cv2.waitKey(1) & 0xFF) == ord("q"):
+            print("Calibration cancelled.")
+            return None
+
+    if col.n < CALIB_MIN_SAMPLES:
+        print(f"Calibration failed: only {col.n} usable frames"
+              f"{' — your face was never detected' if not seen_face else ''}.\n"
+              "  - light your face from the front, sit head-and-shoulders in frame, and try again")
+        return None
+    base = col.finish()
+    print(f"Calibrated on {base.samples} frames. Your neutral face:")
+    for name in ("jawOpen", "noseSneerLeft", "browDownLeft", "mouthFrownLeft", "eyeSquintLeft"):
+        if name in base.mean:
+            print(f"  {name:16s} {base.mean[name]:.3f} ± {base.sigma[name]:.3f}")
+    for w in calibration_warnings(base):
+        print(f"  ! {w}")
+    return base
+
+
+def draw_calibration(img, elapsed, samples, face):
+    H, W = img.shape[:2]
+    left = max(0.0, CALIB_SECONDS - elapsed)
+    cv2.rectangle(img, (0, 0), (W, 96), (0, 0, 0), -1)
+    cv2.putText(img, "CALIBRATING - hold a bored face", (16, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (255, 255, 255), 2)
+    cv2.putText(img, f"{left:0.1f}s   {samples} frames" + ("" if face is not None else "   NO FACE"),
+                (16, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (255, 255, 255) if face is not None else (0, 140, 255), 2)
+    done = int(W * min(elapsed / CALIB_SECONDS, 1.0))
+    cv2.rectangle(img, (0, 84), (done, 96), (0, 220, 0), -1)
+    if face is not None:
+        x0, y0, x1, y1 = face.box
+        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 220, 0), 1)
 
 
 class Asset:
@@ -217,7 +397,7 @@ class Face:
         self.mouth = (p[13] + p[14]) / 2
         self.eye_y = float((p[33][1] + p[263][1]) / 2)
         cl, cr = p[234], p[454]
-        self.turn = abs((self.nose[0] - cl[0]) / max(cr[0] - cl[0], 1e-3) - 0.5)
+        self.turn_signed = float((self.nose[0] - cl[0]) / max(cr[0] - cl[0], 1e-3) - 0.5)
         self.bs = {c.category_name: c.score for c in (blendshapes or [])}
 
     def b(self, name):
@@ -248,9 +428,9 @@ class Body:
         self.elbows_up = self.seen and bool((self.elbows[:, 1] < shoulder_y).all())
 
 
-def tongue_score(frame, face, hands):
+def tongue_score(frame, face, hands, jaw_ready):
     """Fraction of the mouth opening that reads pink: saturated and lit, unlike teeth or throat."""
-    if face.b("jawOpen") < T["tongue_jaw"]:
+    if not jaw_ready:
         return 0.0
     if any(dist(h.palm, face.mouth) < 0.7 * face.w for h in hands):
         return 0.0
@@ -296,7 +476,29 @@ class Motion:
         return self.energy
 
 
-def decide(face, hands, body, tongue, gesture):
+def measure(face, base):
+    """Every expression channel, raw and in sigma above your own neutral."""
+    zpair = lambda n: (base.z(n + "Left", face.b(n + "Left")) + base.z(n + "Right", face.b(n + "Right"))) / 2
+    pair = lambda n: (face.b(n + "Left") + face.b(n + "Right")) / 2
+    m = {
+        "jaw": face.b("jawOpen"), "z_jaw": base.z("jawOpen", face.b("jawOpen")),
+        "sneer": pair("noseSneer"), "z_sneer": zpair("noseSneer"),
+        "z_brow": zpair("browDown"), "z_frown": zpair("mouthFrown"), "z_lip": zpair("mouthUpperUp"),
+        "squint": max(pair("eyeSquint"), pair("eyeBlink")),
+        "z_squint": max(zpair("eyeSquint"), zpair("eyeBlink")),
+        "turn": abs(face.turn_signed - base.neutral_turn),
+    }
+    cap = lambda v: min(v, Z_CAP)
+    m["z_disgust"] = 2 * cap(m["z_sneer"]) + cap(m["z_brow"]) + cap(m["z_frown"]) + cap(m["z_lip"])
+    return m
+
+
+def over(key, m, zkey, rawkey):
+    """Sigma above your neutral AND a raw floor, so a tiny sigma can't become a hair trigger."""
+    return m[zkey] >= Z[key] and m[rawkey] >= FLOOR[key]
+
+
+def decide(face, hands, body, tongue, gesture, m):
     """Return (pose or None, debug dict)."""
     d = {"hands": len(hands)}
     if face is None:
@@ -305,15 +507,9 @@ def decide(face, hands, body, tongue, gesture):
 
     fw = face.w
     near = lambda a, b, k: dist(a, b) < k * fw
-    jaw = face.b("jawOpen")
     elbows_up = bool(body and body.elbows_up)
-    pair = lambda n: (face.b(n + "Left") + face.b(n + "Right")) / 2
-    sneer, brow_down, frown, lip_up = pair("noseSneer"), pair("browDown"), pair("mouthFrown"), pair("mouthUpperUp")
-    disgust = 2 * sneer + brow_down + frown + lip_up
-    squint = max((face.b("eyeSquintLeft") + face.b("eyeSquintRight")) / 2,
-                 (face.b("eyeBlinkLeft") + face.b("eyeBlinkRight")) / 2)
-    d.update(jaw=jaw, tongue=tongue, disgust=disgust, sneer=sneer, brow=brow_down, frown=frown, lip=lip_up,
-             turn=face.turn, squint=squint, gesture=gesture, elbows_up=elbows_up)
+    d.update(m, gesture=gesture, tongue=tongue, elbows_up=elbows_up)
+    screaming = over("scream_jaw", m, "z_jaw", "jaw")
 
     if len(hands) >= 2:
         a, b = hands[0], hands[1]
@@ -328,12 +524,12 @@ def decide(face, hands, body, tongue, gesture):
             return "cover_nose", d
         on_head = lambda h: (h.palm[1] < face.eye_y and abs(h.palm[0] - face.nose[0]) < 1.1 * fw
                              and h.palm[1] > face.top[1] - 0.8 * face.h)
-        if on_head(a) and on_head(b) and jaw > T["scream_jaw"]:
+        if on_head(a) and on_head(b) and screaming:
             return "crashing_out", d
 
     near_head = lambda h: abs(h.palm[0] - face.nose[0]) < 1.3 * fw and h.palm[1] < face.eye_y + 0.3 * face.h
     if elbows_up and all(near_head(h) for h in hands):
-        return ("crashing_out" if jaw > T["scream_jaw"] else "dance"), d
+        return ("crashing_out" if screaming else "dance"), d
 
     for h in hands:
         if near(h.thumb, face.nose, 0.35) and near(h.index, face.nose, 0.35) and near(h.thumb, h.index, 0.3):
@@ -345,18 +541,18 @@ def decide(face, hands, body, tongue, gesture):
 
     if tongue > T["tongue"]:
         return "tongue_out", d
-    if jaw > T["jaw_open"]:
+    if over("jaw_open", m, "z_jaw", "jaw"):
         return "open_mouth", d
-    if sneer > T["sneer"] or disgust > T["disgust"]:
+    if over("sneer", m, "z_sneer", "sneer") or m["z_disgust"] >= Z["disgust"]:
         return "disgusted", d
     if hands and gesture > T["gesture"]:
         return "talking_to_wall", d
-    if face.turn > T["head_turn"] and squint > T["squint"]:
+    if m["turn"] > T["head_turn"] and over("squint", m, "z_squint", "squint"):
         return "suspicious", d
     return None, d
 
 
-def draw_hud(img, shown, raw, d, face, hands, body):
+def draw_hud(img, shown, raw, d, face, hands, body, base):
     if face:
         x0, y0, x1, y1 = face.box
         cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 1)
@@ -365,32 +561,47 @@ def draw_hud(img, shown, raw, d, face, hands, body):
     if body and body.seen:
         for pt in np.vstack([body.shoulders, body.elbows]):
             cv2.circle(img, (int(pt[0]), int(pt[1])), 6, (255, 120, 0), -1)
+    g = d.get
     lines = [
-        f"showing: {shown or '-'}   raw: {raw or '-'}   hands: {d.get('hands', 0)}   elbows up: {'Y' if d.get('elbows_up') else 'n'}",
-        f"jaw {d.get('jaw', 0):.2f}  tongue {d.get('tongue', 0):.2f}  turn {d.get('turn', 0):.2f}  squint {d.get('squint', 0):.2f}  gesture {d.get('gesture', 0):.3f}",
-        f"disgust {d.get('disgust', 0):.2f} = 2x sneer {d.get('sneer', 0):.2f} + brow {d.get('brow', 0):.2f} + frown {d.get('frown', 0):.2f} + lip {d.get('lip', 0):.2f}",
-        "keys: q quit  d hud  1-9 0 - = [ ] test poses",
+        (f"showing: {shown or '-'}   raw: {raw or '-'}   hands: {g('hands', 0)}"
+         f"   elbows up: {'Y' if g('elbows_up') else 'n'}", (0, 255, 0)),
+        (f"jaw {g('jaw', 0):.2f} = {g('z_jaw', 0):+.1f}s/{Z['jaw_open']:.0f}   "
+         f"squint {g('squint', 0):.2f} = {g('z_squint', 0):+.1f}s/{Z['squint']:.0f}   "
+         f"tongue {g('tongue', 0):.2f}   turn {g('turn', 0):.2f}   gesture {g('gesture', 0):.3f}", (0, 255, 0)),
+        (f"disgust {g('z_disgust', 0):+.1f}s/{Z['disgust']:.0f} = 2x sneer {g('z_sneer', 0):+.1f} "
+         f"+ brow {g('z_brow', 0):+.1f} + frown {g('z_frown', 0):+.1f} + lip {g('z_lip', 0):+.1f}", (0, 255, 0)),
+        (("NOT CALIBRATED - generic baseline, everything is harder to trigger. press 'c'"
+          if base.generic else
+          f"calibrated {base.made} on {base.samples} frames   (s = sigma above your neutral)"),
+         (0, 140, 255) if base.generic else (200, 200, 200)),
+        ("keys: q quit  d hud  c recalibrate  1-9 0 - = [ ] test poses", (0, 255, 0)),
     ]
-    for i, t in enumerate(lines):
+    for i, (t, colour) in enumerate(lines):
         y = 24 + 22 * i
         cv2.putText(img, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
-        cv2.putText(img, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+        cv2.putText(img, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 1)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0, help="webcam index (try 1 if 0 is your iPhone)")
+    ap.add_argument("--calibrate", action="store_true", help="learn your neutral face, save it, and exit")
+    ap.add_argument("--no-calibration", action="store_true", help="ignore calibration.json; use the generic baseline")
     ap.add_argument("--no-vcam", action="store_true", help="preview only; don't start the virtual camera")
     ap.add_argument("--skip-check", action="store_true", help="skip the MediaPipe startup check")
     ap.add_argument("--size", default="1280x720", help="capture size, e.g. 1280x720 or 640x480 (lower = faster)")
     ap.add_argument("--no-flip", action="store_true", help="don't mirror the image")
     args = ap.parse_args()
 
+    calib_path = os.path.join(HERE, CALIB_FILE)
+    base = Baseline() if args.no_calibration else Baseline.load(calib_path)
+    if base.generic and not args.calibrate and not args.no_calibration:
+        print(f"No usable {CALIB_FILE}. Running on the generic baseline — everything is harder to\n"
+              f"trigger than it should be. Run:  python {os.path.basename(__file__)} --calibrate")
+
     model_paths = ensure_models()
     if not args.skip_check:
         preflight(model_paths["face_landmarker.task"])
-    print("Assets:")
-    assets = {pose: load_asset(pose) for pose in POSES}
 
     cap = cv2.VideoCapture(args.camera)
     if cap.isOpened() and "x" in args.size:
@@ -410,6 +621,28 @@ def main():
     H, W = frame.shape[:2]
     print(f"Camera {args.camera}: {W}x{H}")
 
+    clock = Clock()
+    window = "it's giving v2  (q quit, d HUD, c recalibrate, 1-9 0 - = [ ] test)"
+
+    if args.calibrate:
+        face_det = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+            base_options=mp_tasks.BaseOptions(model_asset_path=model_paths["face_landmarker.task"]),
+            running_mode=vision.RunningMode.VIDEO, num_faces=1, output_face_blendshapes=True))
+        try:
+            new = run_calibration(cap, face_det, clock, args, W, H, window)
+        finally:
+            face_det.close()
+            cap.release()
+            cv2.destroyAllWindows()
+        if new is None:
+            sys.exit(1)
+        new.save(calib_path)
+        print(f"Saved {CALIB_FILE}. Now run:  python {os.path.basename(__file__)}")
+        return
+
+    print("Assets:")
+    assets = {pose: load_asset(pose) for pose in POSES}
+
     vcam = None
     if not args.no_vcam:
         try:
@@ -426,8 +659,7 @@ def main():
     shown_since = 0.0
     forced, forced_until = None, 0.0
     sm_center, sm_h = np.array([W / 2, H / 2], np.float32), H * 0.45
-    t_start, last_ts = time.monotonic(), -1
-    print("Running. Focus the preview window: q quit, d HUD, 1-9 0 - = [ ] test a pose")
+    print("Running. Focus the preview window: q quit, d HUD, c recalibrate, 1-9 0 - = [ ] test a pose")
 
     try:
         while True:
@@ -440,8 +672,7 @@ def main():
             if not args.no_flip:
                 frame = cv2.flip(frame, 1)
 
-            ts = int((time.monotonic() - t_start) * 1000)
-            ts = last_ts = max(ts, last_ts + 1)
+            ts = clock.next()
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             fr = face_det.detect_for_video(mp_img, ts)
             hr = hand_det.detect_for_video(mp_img, ts)
@@ -451,9 +682,11 @@ def main():
             hands = [Hand(h, W, H) for h in hr.hand_landmarks]
             body = Body(pr.pose_landmarks[0], W, H) if pr.pose_landmarks else None
 
-            tongue = tongue_score(frame, face, hands) if face is not None else 0.0
+            m = measure(face, base) if face is not None else {}
+            tongue = tongue_score(frame, face, hands,
+                                  over("tongue_jaw", m, "z_jaw", "jaw")) if face is not None else 0.0
             gesture = motion.update(hands, face)
-            raw, dbg = decide(face, hands, body, tongue, gesture)
+            raw, dbg = decide(face, hands, body, tongue, gesture, m)
 
             fired = None
             for p in POSES:
@@ -491,13 +724,21 @@ def main():
             preview = frame
             if show_hud:
                 preview = frame.copy()
-                draw_hud(preview, shown, raw, dbg, face, hands, body)
-            cv2.imshow("Reaction Cam  (q quit, d HUD, 1-9 0 - = [ ] test)", preview)
+                draw_hud(preview, shown, raw, dbg, face, hands, body, base)
+            cv2.imshow(window, preview)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("d"):
                 show_hud = not show_hud
+            elif key == ord("c"):
+                new = run_calibration(cap, face_det, clock, args, W, H, window)
+                if new is not None:
+                    base = new
+                    base.save(calib_path)
+                    print(f"Saved {CALIB_FILE}.")
+                motion, shown, hold = Motion(), None, 0
+                arm = {p: 0 for p in POSES}
             elif 0 < key < 256 and chr(key) in TEST_KEYS:
                 forced, forced_until = POSES[TEST_KEYS.index(chr(key))], now + 2.0
     finally:
