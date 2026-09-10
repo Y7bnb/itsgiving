@@ -26,7 +26,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
 
-POSES = ["time_out", "heart", "cover_nose", "crashing_out", "dance", "nose_closed", "flirty", "hand_up",
+POSES = ["time_out", "heart", "cover_nose", "crashing_out", "dance", "nose_closed", "monkey_finger", "cinema", "hand_up",
          "tongue_out", "open_mouth", "disgusted", "talking_to_wall", "suspicious", "spin"]
 TEST_KEYS = "1234567890-=[]"
 
@@ -527,6 +527,9 @@ def decide(face, hands, body, tongue, gesture, m):
         if on_head(a) and on_head(b) and screaming:
             return "crashing_out", d
 
+        if a.palm[1] < face.nose[1] and b.palm[1] < face.nose[1]:
+            return "cinema", d
+
     near_head = lambda h: abs(h.palm[0] - face.nose[0]) < 1.3 * fw and h.palm[1] < face.eye_y + 0.3 * face.h
     if elbows_up and all(near_head(h) for h in hands):
         return ("crashing_out" if screaming else "dance"), d
@@ -535,7 +538,7 @@ def decide(face, hands, body, tongue, gesture, m):
         if near(h.thumb, face.nose, 0.35) and near(h.index, face.nose, 0.35) and near(h.thumb, h.index, 0.3):
             return "nose_closed", d
         if near(h.index, face.mouth, 0.22) and not near(h.palm, face.mouth, 0.3):
-            return "flirty", d
+            return "monkey_finger", d
         if h.open and h.palm[1] < face.nose[1] and abs(h.palm[0] - face.nose[0]) > 0.8 * fw:
             return "hand_up", d
 
